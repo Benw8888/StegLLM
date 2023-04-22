@@ -67,7 +67,6 @@ class BatchedRewardFunction(ABC):
 
 ### Automated reward functions ###########################
 
-
 class CommonGenPenaltyShapingFunction(RewardFunction):
     def __call__(
         self,
