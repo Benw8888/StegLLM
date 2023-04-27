@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 from rl4lms.core_components.sampler import PrioritySampler
 
 # We will structure observations as:
-# tuple: (tokens, meta_info)
+# tuple: (tokens, info_dict)
 
 
 def create_steg_prompt(context, message):
@@ -55,6 +55,7 @@ def create_first_observation(context, message, tokenizer):
         "message": message,
         "decoding": False,
         "prompt_length": prompt_length,
+        "recovered_message": None,
     }
 
     return tokens, info
@@ -97,6 +98,7 @@ def create_decoder_observation(info, decoy_text, tokenizer):
         "message": None,
         "decoding": True,
         "prompt_length": prompt_length,
+        "recovered_message": None,  # only populated at the end of the trajectory
     }
 
     return tokens, new_info
@@ -129,7 +131,7 @@ class StegEnv(Env):
     def __init__(
         self,
         tokenizer: AutoTokenizer,
-        reward_function: RewardFunction,
+        reward_function: SteganographyReward,
         samples: Tuple[List[Sample], float],
         max_episode_length: int = 512,
         priority_scale: float = 0.0,
@@ -151,6 +153,10 @@ class StegEnv(Env):
             context_start_token (bool, optional): start token for the context (For Encoder-Decoder models! )
             prompt_truncation_side (str): truncation side for prompt text (Defaults to "left")
         """
+
+        self.max_encoder_tokens = 200
+        self.max_decoder_tokens = 200
+
         self.tokenizer = tokenizer
         self.reward_function = reward_function
         self.max_steps = max_episode_length
@@ -218,25 +224,35 @@ class StegEnv(Env):
         # Warning! may mutate obs
         # Need to change to handle batched inputs
         tokens, info = obs
+
+        # enforce tokens, action have compatible shapes: (should be 2D for both, action 2D column vector)
+        assert tokens.shape[0] == action.shape[0]
+
         done = False
 
+        new_tokens = torch.cat([tokens, action], dim=-1)
+        new_info = info
+
         if not info["decoding"]:
-            # if action is end of sentence token, switch to decoding:
-            if action == self.tokenizer.eos_token_id:
-                decoy_text = tokens[info["prompt_length"]:]
+            # if action is the last token of encoding stage, switch to decoding:
+            if new_tokens.shape[-1] == self.max_encoder_tokens:
+                decoy_text = new_tokens[info["prompt_length"]:]
                 print("decoy text: ", self.tokenizer.decode(decoy_text))
                 new_tokens, new_info = create_decoder_observation(info, decoy_text, self.tokenizer)
 
-            else: # normal decoy text generation
+            else:  # normal decoy text generation
                 # append action onto end of tokens
+                new_tokens = tokens
                 # update attention mask??
-                pass
-        else: # if already in decoding mode:
-            if action == self.tokenizer.eos_token_id:
+        else:  # if already in decoding mode:
+            if new_tokens.shape[-1] == self.max_decoder_tokens:
+                recovered_message = new_tokens[info["prompt_length"]:]
+                recovered_message_str = self.tokenizer.decode(recovered_message)
+                print("recovered message: ", recovered_message_str)
                 done = True
+                new_info["recovered_message"] = recovered_message_str
 
-        pass
-        return new_tokens, new_info, done
+        return (new_tokens, new_info), done
 
     def copy_obs(self, obs):
         tokens, info = obs
@@ -244,7 +260,7 @@ class StegEnv(Env):
         tokens = tokens.clone()
         return tokens, info
 
-    def step(self, action: int) -> Tuple[Dict[str, torch.tensor], int, bool, dict]:
+    def step(self, action: int):
         self.__time_step += 1
 
         # previous obs
@@ -254,37 +270,34 @@ class StegEnv(Env):
         self.__current_obs, done = self.update_obs(self.__current_obs, action, self.tokenizer)
 
         # decide if the episode is finished or not
-        done = (action == self.tokenizer.eos_token_id and self._terminate_on_eos) or (
-            self.__time_step == self.max_steps
-        )
+        # done = (action == self.tokenizer.eos_token_id and self._terminate_on_eos) or (
+        #     self.__time_step == self.max_steps
+        # )
 
         # compute reward
-        if not isinstance(self.reward_function, BatchedRewardFunction):
-            reward = (
-                None
-                if self.reward_function is None
-                else self.reward_function(
-                    previous_obs,
-                    action,
-                    self.__current_obs,
-                    done,
-                    self.__current_obs.meta_info,
-                )
+        reward = (
+            None
+            if self.reward_function is None
+            else self.reward_function(
+                previous_obs,
+                action,
+                self.__current_obs,
+                done,
             )
-        else:
-            reward = -inf  # will be overridden later
+        )
+
 
         # populate additional info
-        info = {
-            "output": self.__current_obs.context_text,
-            "action_history": self.__current_obs.action_history,
-            "reference_text": self.__current_obs.target_or_reference_texts,
-            "prompt_text": self.__current_obs.prompt_or_input_text,
-            "prev_output": previous_obs.context_text,
-            "meta_info": previous_obs.meta_info,
-        }
+        # info = {
+        #     "output": self.__current_obs.context_text,
+        #     "action_history": self.__current_obs.action_history,
+        #     "reference_text": self.__current_obs.target_or_reference_texts,
+        #     "prompt_text": self.__current_obs.prompt_or_input_text,
+        #     "prev_output": previous_obs.context_text,
+        #     "meta_info": previous_obs.meta_info,
+        # }
 
-        return self.__current_obs.to_dict(), reward, done, info
+        return self.__current_obs, reward, done, #info
 
     def reset(self, sample: Sample = None) -> Dict[str, torch.tensor]:
         """
