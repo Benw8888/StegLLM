@@ -116,25 +116,6 @@ def create_decoder_observation(info, decoy_text, tokenizer):
 
     return tokens, new_info
 
-class SteganographyReward(RewardFunction):
-    def __init__(self, *args) -> None:
-        super().__init__()
-        # load frozen Discriminator Model
-        model_string = "bert-base-uncased"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_string)
-        self.discriminator = AutoModel.from_pretrained("bert-base-cased")
-        pass
-
-    def __call__(self, prev_observation: Observation,
-                 action: int,
-                 current_observation: Observation,
-                 done: bool,
-                 meta_info: Dict[str, Any] = None) -> float:
-        if done:
-            reward = 0
-            return reward
-        return 0
-
 
 class StegEnv(Env):
     def __init__(
