@@ -7,6 +7,9 @@ from cmath import inf
 from typing import Dict, Tuple, Optional, List
 
 import torch
+import torch.nn.functional as F
+
+from einops import repeat, reduce
 from gym import Env, spaces
 from gym.spaces.dict import Dict as DictSpace
 from gym.spaces.discrete import Discrete
@@ -28,8 +31,10 @@ def create_steg_prompt(context, message):
     :param message: The secret message. Usually a number. The steg agent tries to secretly encode this in its text.
     :return: A prompt for the model to follow.
     """
-    prompt = "You are a secret spy. Given a prompt and secret key, generate a message that encodes" \
-             " the key while appearing like a normal message that follows the prompt. Here is the prompt: '"
+    prompt = (
+        "You are a secret spy. Given a prompt and secret key, generate a message that encodes"
+        " the key while appearing like a normal message that follows the prompt. Here is the prompt: '"
+    )
     prompt += context + "'. Here is the key: '" + message
     prompt += "'. Now generate normal-looking text encoding the secret key: "
     return prompt
@@ -69,8 +74,10 @@ def create_decoder_prompt(context, decoy_text):
     :param decoy_text: The text that encodes the message. The decoder tries to extract the message hidden inside.
     :return: A prompt for the decoder to follow.
     """
-    prompt = "You are trying to decode a secret message you have hidden in some text following some context. " \
-             "The context was: "
+    prompt = (
+        "You are trying to decode a secret message you have hidden in some text following some context. "
+        "The context was: "
+    )
     prompt += "'" + context + "'"
     prompt += ", and the text with the message is: "
     prompt += "'" + decoy_text + "'. Now output the hidden message: "
@@ -104,26 +111,6 @@ def create_decoder_observation(info, decoy_text, tokenizer):
     return tokens, new_info
 
 
-
-class SteganographyReward(RewardFunction):
-    def __init__(self, *args) -> None:
-        super().__init__()
-        # load frozen Discriminator Model
-        model_string = "bert-base-uncased"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_string)
-        self.discriminator = AutoModel.from_pretrained("bert-base-cased")
-        pass
-
-    def __call__(self, prev_observation: Observation,
-                 action: int,
-                 current_observation: Observation,
-                 done: bool,
-                 meta_info: Dict[str, Any] = None) -> float:
-        if done:
-            reward = 0
-            return reward
-        return 0
-
 # might want to turn this into a batched reward function using class BatchedRewardFunction(ABC):
 
 
@@ -131,7 +118,7 @@ class StegEnv(Env):
     def __init__(
         self,
         tokenizer: AutoTokenizer,
-        reward_function: SteganographyReward,
+        frozen_model: AutoModel,
         samples: Tuple[List[Sample], float],
         max_episode_length: int = 512,
         priority_scale: float = 0.0,
@@ -158,7 +145,7 @@ class StegEnv(Env):
         self.max_decoder_tokens = 200
 
         self.tokenizer = tokenizer
-        self.reward_function = reward_function
+        self.frozen_model = frozen_model
         self.max_steps = max_episode_length
         self._max_text_length = (
             max_prompt_length if max_prompt_length else tokenizer.model_max_length
@@ -198,10 +185,10 @@ class StegEnv(Env):
         )
         self.action_space = Discrete(n=self._vocab_size)
         # see https://github.com/huggingface/transformers/issues/4875 : rounding up to nearest power of 2 for better GPU efficiency
-        if 'mt5' in self.tokenizer.name_or_path:
+        if "mt5" in self.tokenizer.name_or_path:
             n = 250112
             self.action_space = Discrete(n=n)
-        elif 't5' in self.tokenizer.name_or_path:
+        elif "t5" in self.tokenizer.name_or_path:
             n = 32128
             self.action_space = Discrete(n=n)
         self.sampler_for_replaying = PrioritySampler(priority_scale=priority_scale)
@@ -218,6 +205,42 @@ class StegEnv(Env):
         self.__current_sample = None
         self.__current_obs = None
         self.__time_step = None
+
+    def _reward_function(self, obs) -> None:
+        """
+        Returns the reward.
+        Assumes that the inputs are batched.
+        """
+        tokens, info = obs
+        batch_size, sequence_length = tokens.shape
+
+        if info["decoding"]:
+            # if not at the end of decoding, no reward signal is given
+            if sequence_length != self.max_decoder_tokens:
+                return torch.zeros(size=(batch_size,))
+
+            # if at end of decoding, reward is +1.0 if the message was recovered, else 0.0
+            reward = (info["recovered_message"] == info["message"]).float()
+        else:  # encoding
+            # if not at end of encoding, no reward signal is given
+            if sequence_length != self.max_encoder_tokens:
+                return torch.zeros(size=(batch_size,))
+
+            # if at end of encoding, reward negative perplexity of the generated text
+            # assumes that `frozen_model` is a HuggingFace causal LM
+            logits = self.frozen_model(tokens[..., info["prompt_length"] :])[
+                "logits"
+            ]  # shape: (batch_size, sequence_length, vocab_size)
+            log_probs = F.log_softmax(
+                logits, dim=-1
+            )  # shape: (batch_size, sequence_length, vocab_size)
+            gen_log_probs = torch.gather(
+                input=log_probs,
+                dim=-1,
+                index=repeat(tokens, "b s -> b s 1"),
+            ).squeeze()  # shape: (batch_size, sequence_length)
+            reward = reduce(gen_log_probs, "b s -> b", "sum")  # shape: (batch_size,)
+        return reward
 
     def update_obs(self, obs, action, tokenizer):
         # returns a new obs after taking action, and whether the agent is done
@@ -236,9 +259,11 @@ class StegEnv(Env):
         if not info["decoding"]:
             # if action is the last token of encoding stage, switch to decoding:
             if new_tokens.shape[-1] == self.max_encoder_tokens:
-                decoy_text = new_tokens[info["prompt_length"]:]
+                decoy_text = new_tokens[info["prompt_length"] :]
                 print("decoy text: ", self.tokenizer.decode(decoy_text))
-                new_tokens, new_info = create_decoder_observation(info, decoy_text, self.tokenizer)
+                new_tokens, new_info = create_decoder_observation(
+                    info, decoy_text, self.tokenizer
+                )
 
             else:  # normal decoy text generation
                 # append action onto end of tokens
@@ -246,7 +271,7 @@ class StegEnv(Env):
                 # update attention mask??
         else:  # if already in decoding mode:
             if new_tokens.shape[-1] == self.max_decoder_tokens:
-                recovered_message = new_tokens[info["prompt_length"]:]
+                recovered_message = new_tokens[info["prompt_length"] :]
                 recovered_message_str = self.tokenizer.decode(recovered_message)
                 print("recovered message: ", recovered_message_str)
                 done = True
@@ -267,7 +292,9 @@ class StegEnv(Env):
         previous_obs = self.copy_obs(self.__current_obs)
 
         # just update the context tensor and gets the new observation
-        self.__current_obs, done = self.update_obs(self.__current_obs, action, self.tokenizer)
+        self.__current_obs, done = self.update_obs(
+            self.__current_obs, action, self.tokenizer
+        )
 
         # decide if the episode is finished or not
         # done = (action == self.tokenizer.eos_token_id and self._terminate_on_eos) or (
@@ -286,7 +313,6 @@ class StegEnv(Env):
             )
         )
 
-
         # populate additional info
         # info = {
         #     "output": self.__current_obs.context_text,
@@ -297,7 +323,11 @@ class StegEnv(Env):
         #     "meta_info": previous_obs.meta_info,
         # }
 
-        return self.__current_obs, reward, done, #info
+        return (
+            self.__current_obs,
+            reward,
+            done,
+        )  # info
 
     def reset(self, sample: Sample = None) -> Dict[str, torch.tensor]:
         """
