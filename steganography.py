@@ -1,6 +1,12 @@
 from rl4lms.envs.text_generation.observation import Observation
 from rl4lms.envs.text_generation.reward import RewardFunction
 from transformers import AutoTokenizer, AutoModel
+
+import torch
+from transformers import GPT2Tokenizer
+from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
+from trl.core import respond_to_batch
+
 from typing import List, Dict, Any
 
 from cmath import inf
@@ -102,7 +108,6 @@ def create_decoder_observation(info, decoy_text, tokenizer):
     }
 
     return tokens, new_info
-
 
 
 class SteganographyReward(RewardFunction):
@@ -333,3 +338,47 @@ class StegEnv(Env):
 
     def add_sample(self, sample: Sample, weight: int = 1.0):
         self.sampler_for_replaying.add(sample, weight)
+
+
+class StegAgent:
+    def __init__(self):
+        self.llm_value_head = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
+
+    def __call__(self, obs, **kwargs):
+        tokens, info = obs
+
+        logprobs, value_predictions = self.llm_value_head(tokens)
+
+
+        return logprobs, value_predictions
+
+    def get_action(self, obs, **kwargs):
+        logprobs, value_predictions = self(obs)
+        action = torch.argmax()
+
+
+# 1. load a pretrained model
+model = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
+model_ref = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+# 2. initialize trainer
+ppo_config = {'batch_size': 1}
+config = PPOConfig(**ppo_config)
+ppo_trainer = PPOTrainer(config, model, model_ref, tokenizer)
+
+# 3. encode a query
+query_txt = "This morning I went to the "
+query_tensor = tokenizer.encode(query_txt, return_tensors="pt")
+
+# 4. generate model response
+response_tensor  = respond_to_batch(model, query_tensor)
+response_txt = tokenizer.decode(response_tensor[0,:])
+
+# 5. define a reward for response
+# (this could be any reward such as human feedback or output from another model)
+reward = [torch.tensor(1.0)]
+
+# 6. train model with ppo
+train_stats = ppo_trainer.step([query_tensor[0]], [response_tensor[0]], reward)
+
