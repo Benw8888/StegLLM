@@ -1,11 +1,11 @@
-from rl4lms.envs.text_generation.observation import Observation
-from rl4lms.envs.text_generation.reward import RewardFunction
+# from rl4lms.envs.text_generation.observation import Observation
+# from rl4lms.envs.text_generation.reward import RewardFunction
 from transformers import AutoTokenizer, AutoModel
 
 import torch
 from transformers import GPT2Tokenizer
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
-from trl.core import respond_to_batch
+from trl_custom import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
+from trl_custom.core import respond_to_batch
 
 from typing import List, Dict, Any
 
@@ -19,11 +19,11 @@ from einops import repeat, reduce
 from gym import Env, spaces
 from gym.spaces.dict import Dict as DictSpace
 from gym.spaces.discrete import Discrete
-from rl4lms.data_pools.text_generation_pool import Sample
-from rl4lms.envs.text_generation.reward import BatchedRewardFunction, RewardFunction
-from rl4lms.envs.text_generation.observation import Observation
+# from rl4lms.data_pools.text_generation_pool import Sample
+# from rl4lms.envs.text_generation.reward import BatchedRewardFunction, RewardFunction
+# from rl4lms.envs.text_generation.observation import Observation
 from transformers import AutoTokenizer
-from rl4lms.core_components.sampler import PrioritySampler
+# from rl4lms.core_components.sampler import PrioritySampler
 
 # We will structure observations as:
 # tuple: (tokens, info_dict)
@@ -209,10 +209,11 @@ class StegEnv(Env):
         self.__current_obs = None
         self.__time_step = None
 
-    def _reward_function(self, obs) -> None:
+    def _reward_function(self, encoder_response, response2) -> None:
         """
         Returns the reward.
         Assumes that the inputs are batched.
+        respons
         """
         tokens, info = obs
         batch_size, sequence_length = tokens.shape
