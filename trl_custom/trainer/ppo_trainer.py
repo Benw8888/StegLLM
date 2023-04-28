@@ -646,9 +646,9 @@ class PPOTrainer(BaseTrainer):
         timing["time/ppo/forward_pass"] = time.time() - t
 
         t = time.time()
-        rewards_encoder, non_score_reward_encoder = self.compute_rewards(scores_encoder, all_logprobs_encoder, _,
+        rewards_encoder, non_score_reward_encoder = self.compute_rewards(scores_encoder, all_logprobs_encoder, None,
                                                                          masks_encoder)
-        rewards_decoder, non_score_reward_decoder = self.compute_rewards(scores_decoder, all_logprobs_decoder, _,
+        rewards_decoder, non_score_reward_decoder = self.compute_rewards(scores_decoder, all_logprobs_decoder, None,
                                                                          masks_decoder)
         rewards = torch.cat([rewards_encoder, rewards_decoder], dim=-1)
 
