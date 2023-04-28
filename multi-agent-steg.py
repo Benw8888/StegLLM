@@ -1,20 +1,25 @@
 import torch
-from transformers import AutoTokenizer
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
+from transformers import AutoTokenizer, AutoModel
+from trl import PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
 import wandb
 from typing import Dict, Tuple, Optional, List
 
 class StegEnv():
     def __init__(self, 
-                 tokenizer: AutoTokenizer,
-                 batch_size: int = 16,
-                 ):
+                tokenizer: AutoTokenizer,
+                batch_size: int = 16,
+                device: str = 'cpu',
+            ):
         self.tokenizer = tokenizer
+        self.device = device
         self.batch_size = batch_size
         self.key_length = 4 # must be >= 4 for now because of ppo_train
 
-        self.prompts = [" 0 7 3 8", "This morning I went to the ", "The weather today is ", "What is your favorite "]
         self.key_tokens = [' 0', ' 1', ' 2', ' 3', ' 4', ' 5', ' 6', ' 7', ' 8', ' 9']
+        self.prompts = [" 0 7 3 8 4", "Yesterday I went to ", "The weather today is ", "What is your favorite "]
+
+        self.prompts_pt = self.tokenizer(self.prompts, return_tensors='pt', padding=True)['input_ids'].to(self.device)
+        self.key_tokens_pt = self.tokenizer(self.key_tokens, return_tensors='pt', padding=True)['input_ids'].squeeze().to(self.device)
 
         self.enc_response_len = 4
         self.dec_response_len = self.key_length
@@ -24,98 +29,99 @@ class StegEnv():
 
 
     def _get_queries(self):
-        return ["key:" + key + " prompt:" + prompt for key, prompt in zip(self.key_batch, self.prompt_batch)]
+        """
+        Generates queries of the form "$key:[key]$prompt:[prompt]"
+        """
+        key_buff = "$key:"
+        prompt_buff = "$prompt:"
+
+        key_buff_batch = self.tokenizer(key_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
+        prompt_buff_batch = self.tokenizer(prompt_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
+
+        self.query_batch = torch.cat((key_buff_batch, self.key_batch, prompt_buff_batch, self.prompt_batch), dim=-1)
     
     def _get_obs(self):
-        queries = self._get_queries()
-        query_pt = [self.tokenizer.encode(query, return_tensors="pt").squeeze() for query in queries]
-        prompt_pt = [self.tokenizer.encode(prompt, return_tensors="pt").squeeze() for prompt in self.prompt_batch]
+
         return {
-            "query": queries,
-            "query_pt": query_pt,
+            "query": self.query_batch,
             "prompt": self.prompt_batch,
-            "prompt_pt": prompt_pt,
             "key": self.key_batch
         }
 
     def reset(self, ):
-        prompt_idxs = torch.randint(len(self.prompts), size=(self.batch_size,))
-        key_idxs = torch.randint(len(self.key_tokens), size=(self.batch_size, self.key_length))
+        
+        prompt_idxs = torch.randint(len(self.prompts_pt), size=(self.batch_size,))
+        key_idxs = torch.randint(len(self.key_tokens_pt), size=(self.batch_size, self.key_length))
 
-        self.prompt_batch = [self.prompts[idx] for idx in prompt_idxs]
-        self.key_batch = ["".join([self.key_tokens[idx] for idx in idxs]) for idxs in key_idxs]
-
-        print(self.prompt_batch)
-        print(self.key_batch)
-
+        self.prompt_batch = self.prompts_pt[prompt_idxs]
+        self.key_batch = self.key_tokens_pt[key_idxs]
+        self._get_queries()
+        
         obs = self._get_obs()
 
         return obs
 
-    def _reward_function(self, responses_encoder, responses_decoder):
+    def _reward_function(self, encoder_response, decoder_response):
 
-        rewards_encoder = []
-        rewards_decoder = []
+        reward_encoder = reward_decoder = (decoder_response == self.key_batch).sum(dim=-1).float()
+        return (reward_encoder, reward_decoder)
 
-        for response_enc, response_dec, key in zip(responses_encoder, responses_decoder, self.key_batch):
-            key_pt = self.tokenizer.encode(key, return_tensors="pt").squeeze()
+    def step(self, encoder_response, decoder_response):
 
-            # if response_dec_txt == key:
-            #     reward_enc, reward_dec = 1.0, 1.0
-            # else:
-            #     reward_enc, reward_dec = 0.0, 0.0
-
-            reward_enc = reward_dec = (key_pt == response_dec).sum().float()
-
-            rewards_encoder.append(reward_enc)
-            rewards_decoder.append(reward_dec)
-
-        return (rewards_encoder, rewards_decoder)
-
-    def step(self, responses_encoder, responses_decoder):
-
-        reward = self._reward_function(responses_encoder, responses_decoder)
+        reward = self._reward_function(encoder_response, decoder_response)
         return reward
+
 
 class StegPPOTrainer():
     def __init__(self,
+            model: AutoModel,
+            model_ref: AutoModel,
+            tokenizer: AutoTokenizer,
+            device: str = 'cpu',
             multi_agent = True,
         ):
         
+        self.model = model
+        self.model_ref = model_ref
+        self.tokenizer = tokenizer
+        self.device = device
         self.multi_agent = multi_agent
+
         batch_size = 16
         self.num_episodes = 100
-
-        # 1. load a pretrained model
-        self.model = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
-        self.model_ref = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
-
-        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # initialize environment
         self.env = StegEnv(
             tokenizer = self.tokenizer,
-            batch_size = batch_size
+            device=device,
+            batch_size=batch_size,
         )
 
-        # get tokens to suppress
-        key_token_ids = self.tokenizer(self.env.key_tokens)['input_ids']
-        self.suppress_tokens = [i for i in range(self.tokenizer.vocab_size) if [i] not in key_token_ids]
+        self.enc_gen_kwargs = {
+            "min_length": -1,
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+            "pad_token_id": self.tokenizer.eos_token_id,
+            "max_new_tokens": self.env.enc_response_len
+        }
 
-        # 2. initialize trainer
+        # get tokens to suppress
+        self.suppress_tokens = [i for i in range(self.tokenizer.vocab_size) if i not in self.env.key_tokens_pt]
+        
+        self.dec_gen_kwargs = {
+            "suppress_tokens": self.suppress_tokens, 
+            "max_new_tokens": self.env.dec_response_len, 
+            **self.enc_gen_kwargs
+        }
+
         config = PPOConfig(
-            batch_size=batch_size * 2, # double for encoder + decoder responses
+            batch_size= batch_size * 2 if multi_agent else batch_size, # double for encoder + decoder responses
             learning_rate=1e-5,
             steps=5000,
             )
+            
         self.ppo_trainer = PPOTrainer(config, self.model, self.model_ref, self.tokenizer)
-
-        wandb.init(
-            # Set the project where this run will be logged
-            project="my-awesome-project",
-            # Track hyperparameters and run metadata
-            )
         
     def log_stats(
         self,
@@ -138,7 +144,7 @@ class StegPPOTrainer():
 
         # Log stats
         if not isinstance(rewards, torch.Tensor):
-            rewards = torch.tensor(rewards) #.to(self.current_device)
+            rewards = torch.tensor(rewards).to(self.device)
 
         logs.update(stats)
 
@@ -153,81 +159,69 @@ class StegPPOTrainer():
 
         wandb.log(logs)
 
-    def get_generation_kwargs(self):
-
-        encoder_generation_kwargs = {
-            "min_length": -1,
-            "top_k": 0.0,
-            "top_p": 1.0,
-            "do_sample": True,
-            "pad_token_id": self.tokenizer.eos_token_id,
-            "max_new_tokens": self.env.enc_response_len
-        }
-
-        decoder_generation_kwargs = {"suppress_tokens": self.suppress_tokens, 
-                                    "max_new_tokens": self.env.dec_response_len, 
-                                    **encoder_generation_kwargs}
-        
-        return encoder_generation_kwargs, decoder_generation_kwargs
-
     def get_model_responses(self, obs):
-        
-        encoder_queries = []
-        decoder_queries = []
-        encoder_responses = []
-        decoder_responses = []
 
-        enc_gen_kwargs, dec_gen_kwargs = self.get_generation_kwargs()
+        encoder_query = obs['query']
+        encoder_response = self.model.generate(encoder_query, **self.enc_gen_kwargs) # should this be ppo_trainer.generate????
+        encoder_response = encoder_response[:, -self.enc_gen_kwargs["max_new_tokens"]:]
 
-        for query_encoder_pt, prompt_encoder_pt in zip(obs['query_pt'], obs['prompt_pt']):
+        decoder_query = torch.cat((obs['prompt'], encoder_response), dim=-1)
+        decoder_response = self.model.generate(decoder_query, **self.dec_gen_kwargs)
+        decoder_response = decoder_response[:, -self.dec_gen_kwargs["max_new_tokens"]:]
 
-            # get encoder response on prompt
-            response_encoder_pt = self.ppo_trainer.generate(query_encoder_pt, **enc_gen_kwargs)
-            response_encoder_pt = response_encoder_pt.squeeze()[-enc_gen_kwargs["max_new_tokens"]:]
-            encoder_queries.append(query_encoder_pt)
-            encoder_responses.append(response_encoder_pt)
-
-            # construct decoder query which exclues key
-            query_decoder_pt = torch.cat((prompt_encoder_pt, response_encoder_pt))
-
-            # get decoder response
-            response_decoder_pt = self.ppo_trainer.generate(query_decoder_pt, **dec_gen_kwargs)
-            response_decoder_pt = response_decoder_pt.squeeze()[-dec_gen_kwargs["max_new_tokens"]:]
-            
-            decoder_queries.append(query_decoder_pt)
-            decoder_responses.append(response_decoder_pt)
-
-        return encoder_queries, encoder_responses, decoder_queries, decoder_responses
+        return encoder_query, encoder_response, decoder_query, decoder_response
 
     def train(self):
 
         for _ in range(self.num_episodes):
             obs = self.env.reset()
-            encoder_queries, encoder_responses, decoder_queries, decoder_responses = self.get_model_responses(obs)
-            encoder_rewards, decoder_rewards = self.env.step(encoder_responses, decoder_responses)
+            enc_query, enc_response, dec_query, dec_response = self.get_model_responses(obs)
+            enc_reward, dec_reward = self.env.step(enc_response, dec_response)
 
-            print(obs['query'])
-            print('encoder respsonses', [self.tokenizer.decode(res) for res in encoder_responses])
-            print('encoder', encoder_rewards)
-            print('decoder respsonses', [self.tokenizer.decode(res) for res in decoder_responses])
-            print('rewards: ', decoder_rewards)
+            print('-----------------------------------------------------------------------')
+            print('Prompt and keys:')
+            print(self.tokenizer.batch_decode(obs['prompt']))
+            print(self.tokenizer.batch_decode(obs['key']))
+            print('Encoder:')
+            print(self.tokenizer.batch_decode(enc_response))
+            print(enc_reward)
+            print('Decoder:')
+            print(self.tokenizer.batch_decode(dec_response))
+            print(dec_reward)
             print()
 
             if self.multi_agent:
 
-                queries = encoder_queries + decoder_queries
-                responses = encoder_responses + decoder_responses
-                rewards = encoder_rewards + decoder_rewards
+                query = list(enc_query) + list(dec_query)
+                response = list(enc_response) + list(dec_response)
+                reward = list(enc_reward) + list(dec_reward)
 
-                stats = self.ppo_trainer.step(queries, responses, rewards)
+                stats = self.ppo_trainer.step(query, response, reward)
 
             else:
-                self.ppo_trainer.step(encoder_queries, encoder_responses, encoder_rewards,
-                                      decoder_queries, decoder_responses, decoder_rewards)
+                stats = self.ppo_trainer.step(enc_query, enc_response, enc_reward, dec_query, dec_response, dec_reward)
 
-            # ppo_encoder_trainer.log_stats(stats1, {'query':encoder_queries, 'response': encoder_responses}, encoder_rewards)
-            self.log_stats(stats, {'query':decoder_queries, 'response': decoder_responses}, decoder_rewards)
+            self.log_stats(stats, {}, dec_reward)
 
-if __name__ == '__main__':
-    steg_trainer = StegPPOTrainer(multi_agent = True)
+
+if __name__ == "__main__":
+
+    multi_agent = True
+
+    if multi_agent:
+        from trl import PPOTrainer
+    else:
+        from trl_custom import PPOTrainer
+
+    device = 0 if torch.cuda.is_available() else 'cpu'
+
+    model = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2').to(device)
+    model_ref = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2').to(device)
+
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    tokenizer.pad_token = tokenizer.eos_token
+
+    wandb.init(project="my-awesome-project")
+
+    steg_trainer = StegPPOTrainer(model, model_ref, tokenizer, multi_agent=multi_agent, device=device)
     steg_trainer.train()
