@@ -672,26 +672,30 @@ class PPOTrainer(BaseTrainer):
             "masks": masks_decoder,
         }
 
+        mini_batch_dict_encoder.update(model_inputs_encoder)
+        mini_batch_dict_decoder.update(model_inputs_decoder)
+
+        mini_batch_dict = dict()  # combine two dictionaries into one before turning into a shuffled dataset
+        for key in mini_batch_dict_encoder:
+            mini_batch_dict[key+"_encoder"] = mini_batch_dict_encoder[key]
+        for key in mini_batch_dict_decoder:
+            mini_batch_dict[key+"_decoder"] = mini_batch_dict_encoder[key]
+
+        mini_batch_data = Dataset.from_dict(mini_batch_dict)
+
+        mini_batch_data.set_format("torch")
+
         def collator(data):
             return_dict = dict()
             for key in data[0]:
-                if key in ["queries", "responses"]:
+                if key in ["queries_encoder", "queries_decoder", "responses_encoder", "responses_decoder"]:
                     return_dict[key] = [d[key] for d in data]
                 else:
                     return_dict[key] = torch.stack([d[key] for d in data]).to(self.current_device)
             return return_dict
 
-        mini_batch_dict_encoder.update(model_inputs_encoder)
-        mini_batch_dict_decoder.update(model_inputs_decoder)
-
-        mini_batch_data_encoder = Dataset.from_dict(mini_batch_dict_encoder)
-        mini_batch_data_decoder = Dataset.from_dict(mini_batch_dict_decoder)
-
-        mini_batch_data_encoder.set_format("torch")
-        mini_batch_data_decoder.set_format("torch")
-
         mini_batch_dataloader = torch.utils.data.DataLoader(
-            mini_batch_data_encoder,
+            mini_batch_data,
             batch_size=self.config.mini_batch_size,
             shuffle=True,
             collate_fn=collator,
@@ -705,19 +709,25 @@ class PPOTrainer(BaseTrainer):
                 break
             for batch in mini_batch_dataloader:
                 with self.accelerator.accumulate(self.model):
-                    model_inputs = {k: batch[k] for k in model_inputs_names}
-                    logprobs, logits, vpreds, _ = self.batched_forward_pass(
-                        self.model, batch["queries"], batch["responses"], model_inputs, return_logits=True
+                    model_inputs_encoder = {k + "_encoder": batch[k + "_encoder"] for k in model_inputs_names_encoder}
+                    model_inputs_decoder = {k + "_decoder": batch[k + "_decoder"] for k in model_inputs_names_decoder}
+                    logprobs_encoder, logits_encoder, vpreds_encoder, _ = self.batched_forward_pass(
+                        self.model, batch["queries_encoder"], batch["responses_encoder"], model_inputs_encoder,
+                        return_logits=True
+                    )
+                    logprobs_decoder, logits_decoder, vpreds_decoder, _ = self.batched_forward_pass(
+                        self.model, batch["queries_decoder"], batch["responses_decoder"], model_inputs_decoder,
+                        return_logits=True
                     )
 
                 train_stats = self.train_minibatch(
-                    batch["logprobs"],
-                    batch["values"],
-                    batch["rewards"],
-                    logprobs,
-                    logits,
-                    vpreds,
-                    batch["masks"],
+                    torch.cat([batch["logprobs_encoder"], batch["logprobs_decoder"]], dim=1),
+                    torch.cat([batch["values_encoder"],batch["values_decoder"]], dim=1),
+                    torch.cat([batch["rewards_encoder"],batch["rewards_decoder"]], dim=1),
+                    torch.cat([logprobs_encoder,logprobs_decoder], dim=1),
+                    torch.cat([logits_encoder,logits_decoder],dim=1),
+                    torch.cat([vpreds_encoder,vpreds_decoder], dim=1),
+                    torch.cat([batch["masks_encoder"],batch["masks_decoder"]], dim=1)
                 )
 
                 all_stats.append(train_stats)
@@ -738,16 +748,21 @@ class PPOTrainer(BaseTrainer):
         train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
         train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"]).unsqueeze(0)
 
+        all_logprobs = torch.cat([all_logprobs_encoder, all_logprobs_decoder], dim=1)
+        all_masks = torch.cat([masks_encoder, masks_decoder],dim=1)
+        all_queries = torch.cat([queries_encoder, queries_decoder], dim=1)
+        all_responses = torch.cat([responses_encoder, responses_decoder], dim=1)
+
         stats = self.record_step_stats(
             scores=scores,
             logprobs=all_logprobs,
-            ref_logprobs=ref_logprobs,
-            non_score_reward=non_score_reward,
+            ref_logprobs=torch.zeros_like(all_logprobs),
+            non_score_reward=torch.cat([non_score_reward_encoder, non_score_reward_decoder], dim=1),
             train_stats=train_stats,
             kl_coef=self.kl_ctl.value,
-            masks=masks,
-            queries=queries,
-            responses=responses,
+            masks=all_masks,
+            queries=all_queries,
+            responses=all_responses,
         )
         # Gather/Reduce stats from all processes
         if self.is_distributed:
@@ -757,7 +772,7 @@ class PPOTrainer(BaseTrainer):
         stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
 
         # Update the KL control - multiply the batch_size by the number of processes
-        self.kl_ctl.update(stats["objective/kl"], self.config.batch_size * self.accelerator.num_processes)
+        #self.kl_ctl.update(stats["objective/kl"], self.config.batch_size * self.accelerator.num_processes)
 
         # Log the total ppo time
         timing["time/ppo/total"] = time.time() - t0
@@ -968,6 +983,16 @@ class PPOTrainer(BaseTrainer):
             train_stats (dict[str, `torch.Tensor`]):
                 Dictionary of training statistics
         """
+        # old_logprobs = torch.cat([old_logprobs_encoder,old_logprobs_decoder], dim=1)
+        # values = torch.cat([values_encoder,values_decoder], dim=1)
+        # rewards = torch.cat([rewards_encoder,rewards_decoder], dim=1)
+        # logits = torch.cat([logits_encoder,logits_decoder], dim=1)
+        # vpreds = torch.cat([vpreds_encoder,vpreds_decoder], dim=1)
+        # logprobs = torch.cat([logprobs_encoder,logprobs_decoder], dim=1)
+        # mask = torch.cat([mask_encoder,mask_decoder], dim=1)
+
+        print(old_logprobs.shape)
+
         loss_p, loss_v, train_stats = self.loss(old_logprobs, values, rewards, logits, vpreds, logprobs, mask)
         loss = loss_p + loss_v
         self.optimizer.zero_grad()
