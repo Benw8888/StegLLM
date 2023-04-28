@@ -90,7 +90,7 @@ class TestPeftDependancy(unittest.TestCase):
 
     def test_no_peft(self):
         with patch.dict(sys.modules, {"peft": None}):
-            from trl import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead
+            from trl_custom import AutoModelForCausalLMWithValueHead, AutoModelForSeq2SeqLMWithValueHead
 
             # Check that loading a model with `peft` will raise an error
             with self.assertRaises(ModuleNotFoundError):
@@ -101,7 +101,7 @@ class TestPeftDependancy(unittest.TestCase):
 
     def test_imports_no_peft(self):
         with patch.dict(sys.modules, {"peft": None}):
-            from trl import (  # noqa
+            from trl_custom import (  # noqa
                 AutoModelForCausalLMWithValueHead,
                 AutoModelForSeq2SeqLMWithValueHead,
                 PPOConfig,
@@ -111,7 +111,7 @@ class TestPeftDependancy(unittest.TestCase):
 
     def test_ppo_trainer_no_peft(self):
         with patch.dict(sys.modules, {"peft": None}):
-            from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
+            from trl_custom import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 
             ppo_model_id = "trl-internal-testing/dummy-GPT2-correct-vocab"
 

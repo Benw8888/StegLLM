@@ -15,7 +15,7 @@ import unittest
 
 import torch
 
-from trl import is_peft_available
+from trl_custom import is_peft_available
 
 
 def require_peft(test_case):
