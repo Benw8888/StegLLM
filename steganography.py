@@ -368,23 +368,6 @@ class StegEnv(Env):
         self.sampler_for_replaying.add(sample, weight)
 
 
-class StegAgent:
-    def __init__(self):
-        self.llm_value_head = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
-
-    def __call__(self, obs, **kwargs):
-        tokens, info = obs
-
-        logprobs, value_predictions = self.llm_value_head(tokens)
-
-
-        return logprobs, value_predictions
-
-    def get_action(self, obs, **kwargs):
-        logprobs, value_predictions = self(obs)
-        action = torch.argmax()
-
-
 # 1. load a pretrained model
 model = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
 model_ref = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2')
