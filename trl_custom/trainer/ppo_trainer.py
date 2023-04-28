@@ -709,8 +709,8 @@ class PPOTrainer(BaseTrainer):
                 break
             for batch in mini_batch_dataloader:
                 with self.accelerator.accumulate(self.model):
-                    model_inputs_encoder = {k + "_encoder": batch[k + "_encoder"] for k in model_inputs_names_encoder}
-                    model_inputs_decoder = {k + "_decoder": batch[k + "_decoder"] for k in model_inputs_names_decoder}
+                    model_inputs_encoder = {k: batch[k + "_encoder"] for k in model_inputs_names_encoder}
+                    model_inputs_decoder = {k: batch[k + "_decoder"] for k in model_inputs_names_decoder}
                     logprobs_encoder, logits_encoder, vpreds_encoder, _ = self.batched_forward_pass(
                         self.model, batch["queries_encoder"], batch["responses_encoder"], model_inputs_encoder,
                         return_logits=True
@@ -750,8 +750,8 @@ class PPOTrainer(BaseTrainer):
 
         all_logprobs = torch.cat([all_logprobs_encoder, all_logprobs_decoder], dim=1)
         all_masks = torch.cat([masks_encoder, masks_decoder],dim=1)
-        all_queries = torch.cat([queries_encoder, queries_decoder], dim=1)
-        all_responses = torch.cat([responses_encoder, responses_decoder], dim=1)
+        all_queries = queries_encoder
+        all_responses = responses_encoder
 
         stats = self.record_step_stats(
             scores=scores,
@@ -991,7 +991,6 @@ class PPOTrainer(BaseTrainer):
         # logprobs = torch.cat([logprobs_encoder,logprobs_decoder], dim=1)
         # mask = torch.cat([mask_encoder,mask_decoder], dim=1)
 
-        print(old_logprobs.shape)
 
         loss_p, loss_v, train_stats = self.loss(old_logprobs, values, rewards, logits, vpreds, logprobs, mask)
         loss = loss_p + loss_v
@@ -1027,7 +1026,7 @@ class PPOTrainer(BaseTrainer):
                 Log probabilities of the reference model, shape (`batch_size`, `response_length`)
         """
         rewards, non_score_rewards = [], []
-        for score, logprob, ref_logprob, mask in zip(scores, logprobs, ref_logprobs, masks):
+        for score, logprob, mask in zip(scores, logprobs, masks):
             # compute KL penalty (from difference in logprobs)
             #kl = logprob - ref_logprob
             #non_score_reward = -self.kl_ctl.value * kl

@@ -21,8 +21,8 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, pipeline
 
-from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
-from trl.core import LengthSampler
+from trl_custom import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
+from trl_custom.core import LengthSampler
 
 
 ########################################################################

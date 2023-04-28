@@ -15,7 +15,7 @@ import unittest
 
 import torch
 
-from trl.core import masked_mean, masked_var, masked_whiten, whiten
+from trl_custom.core import masked_mean, masked_var, masked_whiten, whiten
 
 
 class CoreTester(unittest.TestCase):

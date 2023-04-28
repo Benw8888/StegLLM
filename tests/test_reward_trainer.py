@@ -18,8 +18,8 @@ import torch
 from datasets import Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments
 
-from trl import RewardTrainer
-from trl.trainer import compute_accuracy
+from trl_custom import RewardTrainer
+from trl_custom.trainer import compute_accuracy
 
 from .testing_utils import require_peft
 

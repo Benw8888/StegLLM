@@ -19,7 +19,7 @@ import torch
 from pytest import mark
 from transformers import AutoModelForCausalLM
 
-from trl import AutoModelForCausalLMWithValueHead, is_peft_available
+from trl_custom import AutoModelForCausalLMWithValueHead, is_peft_available
 
 
 if is_peft_available():
