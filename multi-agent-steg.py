@@ -13,7 +13,12 @@ class StegEnv():
         self.tokenizer = tokenizer
         self.device = device
         self.batch_size = batch_size
-        self.key_length = 4 # must be >= 4 for now because of ppo_train
+        self.key_length = 1 
+        self.enc_response_len = 4
+        self.dec_response_len = max(self.key_length, 4) # must be >= 4 for now because of ppo_train
+
+        if self.key_length < self.dec_response_len:
+            print("Warning: key length is less than decoder response length. Reward will only use first [key_length] tokens.")
 
         self.key_tokens = [' 0', ' 1', ' 2', ' 3', ' 4', ' 5', ' 6', ' 7', ' 8', ' 9']
         self.prompts = [" 0 7 3 8 4", "Yesterday I went to ", "The weather today is ", "What is your favorite "]
@@ -21,24 +26,25 @@ class StegEnv():
         self.prompts_pt = self.tokenizer(self.prompts, return_tensors='pt', padding=True)['input_ids'].to(self.device)
         self.key_tokens_pt = self.tokenizer(self.key_tokens, return_tensors='pt', padding=True)['input_ids'].squeeze().to(self.device)
 
-        self.enc_response_len = 4
-        self.dec_response_len = self.key_length
-
         self.prompt_batch = None
         self.key_batch = None
 
-
-    def _get_queries(self):
-        """
-        Generates queries of the form "$key:[key]$prompt:[prompt]"
-        """
         key_buff = "$key:"
         prompt_buff = "$prompt:"
 
-        key_buff_batch = self.tokenizer(key_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
-        prompt_buff_batch = self.tokenizer(prompt_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
+        self.key_buff_batch = self.tokenizer(key_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
+        self.prompt_buff_batch = self.tokenizer(prompt_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
 
-        self.query_batch = torch.cat((key_buff_batch, self.key_batch, prompt_buff_batch, self.prompt_batch), dim=-1)
+    def _get_encoder_query(self, key, prompt):
+        """
+        Generates queries of the form "$key:[key]$prompt:[prompt]"
+        """
+        return torch.cat((self.key_buff_batch, key, self.key_buff_batch), dim=-1)
+        # return torch.cat((self.key_buff_batch, key, prompt_buff_batch, self.prompt_batch), dim=-1)
+
+    def _get_decoder_query(self, prompt, response):
+        return torch.cat((response, self.key_buff_batch), dim=-1)
+        # return torch.cat((prompt, response, self.key_buff_batch), dim=-1)
     
     def _get_obs(self):
 
@@ -55,7 +61,7 @@ class StegEnv():
 
         self.prompt_batch = self.prompts_pt[prompt_idxs]
         self.key_batch = self.key_tokens_pt[key_idxs]
-        self._get_queries()
+        self.query_batch = self._get_encoder_query(self.key_batch, self.prompt_batch)
         
         obs = self._get_obs()
 
@@ -63,6 +69,7 @@ class StegEnv():
 
     def _reward_function(self, encoder_response, decoder_response):
 
+        decoder_response = decoder_response[:, :self.key_length] # only use first [key_length] tokens
         reward_encoder = reward_decoder = (decoder_response == self.key_batch).sum(dim=-1).float()
         return (reward_encoder, reward_decoder)
 
@@ -74,27 +81,26 @@ class StegEnv():
 
 class StegPPOTrainer():
     def __init__(self,
+            config: dict,
             model: AutoModel,
             model_ref: AutoModel,
             tokenizer: AutoTokenizer,
-            device: str = 'cpu',
-            multi_agent = True,
         ):
         
         self.model = model
         self.model_ref = model_ref
         self.tokenizer = tokenizer
-        self.device = device
-        self.multi_agent = multi_agent
 
-        batch_size = 16
-        self.num_episodes = 100
+        batch_size = config['batch_size']
+        self.episodes = config['episodes']
+        self.device = config['device']
+        self.multi_agent = config['multi_agent']
 
         # initialize environment
         self.env = StegEnv(
             tokenizer = self.tokenizer,
-            device=device,
             batch_size=batch_size,
+            device=device,
         )
 
         self.enc_gen_kwargs = {
@@ -108,17 +114,17 @@ class StegPPOTrainer():
 
         # get tokens to suppress
         self.suppress_tokens = [i for i in range(self.tokenizer.vocab_size) if i not in self.env.key_tokens_pt]
-        
+
         self.dec_gen_kwargs = {
-            "suppress_tokens": self.suppress_tokens, 
+            **self.enc_gen_kwargs,
+            # "suppress_tokens": self.suppress_tokens, 
             "max_new_tokens": self.env.dec_response_len, 
-            **self.enc_gen_kwargs
         }
 
         config = PPOConfig(
             batch_size= batch_size * 2 if multi_agent else batch_size, # double for encoder + decoder responses
-            learning_rate=1e-5,
-            steps=5000,
+            learning_rate=config['learning_rate'],
+            steps=config['steps'],
             )
             
         self.ppo_trainer = PPOTrainer(config, self.model, self.model_ref, self.tokenizer)
@@ -126,19 +132,10 @@ class StegPPOTrainer():
     def log_stats(
         self,
         stats: dict,
-        batch: dict,
         rewards: List[torch.FloatTensor],
     ):
         """
         A function that logs all the training stats. Call it at the end of each epoch.
-
-        Args:
-            stats (dict[str, Any]):
-                A dictionary of training stats.
-            batch (dict[str, Any]):
-                A dictionary of batch data, this contains the queries and responses.
-            rewards (`List[torch.FloatTensor]`):
-                A tensor of rewards.
         """
         logs = {}
 
@@ -165,7 +162,7 @@ class StegPPOTrainer():
         encoder_response = self.model.generate(encoder_query, **self.enc_gen_kwargs) # should this be ppo_trainer.generate????
         encoder_response = encoder_response[:, -self.enc_gen_kwargs["max_new_tokens"]:]
 
-        decoder_query = torch.cat((obs['prompt'], encoder_response), dim=-1)
+        decoder_query = self.env._get_decoder_query(obs['prompt'], encoder_response)
         decoder_response = self.model.generate(decoder_query, **self.dec_gen_kwargs)
         decoder_response = decoder_response[:, -self.dec_gen_kwargs["max_new_tokens"]:]
 
@@ -173,19 +170,21 @@ class StegPPOTrainer():
 
     def train(self):
 
-        for _ in range(self.num_episodes):
+        for _ in range(self.episodes):
             obs = self.env.reset()
             enc_query, enc_response, dec_query, dec_response = self.get_model_responses(obs)
             enc_reward, dec_reward = self.env.step(enc_response, dec_response)
 
             print('-----------------------------------------------------------------------')
-            print('Prompt and keys:')
+            print('prompt, keys:')
             print(self.tokenizer.batch_decode(obs['prompt']))
             print(self.tokenizer.batch_decode(obs['key']))
-            print('Encoder:')
+            print('\nencoder:')
+            print(self.tokenizer.batch_decode(obs['query']))
             print(self.tokenizer.batch_decode(enc_response))
             print(enc_reward)
-            print('Decoder:')
+            print('\ndecoder:')
+            print(self.tokenizer.batch_decode(dec_query))
             print(self.tokenizer.batch_decode(dec_response))
             print(dec_reward)
             print()
@@ -201,7 +200,7 @@ class StegPPOTrainer():
             else:
                 stats = self.ppo_trainer.step(enc_query, enc_response, enc_reward, dec_query, dec_response, dec_reward)
 
-            self.log_stats(stats, {}, dec_reward)
+            self.log_stats(stats, dec_reward)
 
 
 if __name__ == "__main__":
@@ -223,5 +222,13 @@ if __name__ == "__main__":
 
     wandb.init(project="my-awesome-project")
 
-    steg_trainer = StegPPOTrainer(model, model_ref, tokenizer, multi_agent=multi_agent, device=device)
-    steg_trainer.train()
+    config = {
+        'batch_size': 16,
+        'learning_rate': 1e-6,
+        'steps': 1000,
+        'episodes': 1000,
+        'device': device,
+        'multi_agent': multi_agent
+    }
+
+    steg_trainer = StegPPOTrainer(config, model, model_ref, tokenizer)
