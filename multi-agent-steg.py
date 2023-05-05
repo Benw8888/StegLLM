@@ -16,10 +16,13 @@ class StegEnv():
                 tokenizer: AutoTokenizer,
                 batch_size: int = 16,
                 device: str = 'cpu',
+                trainer = None
             ):
         self.tokenizer = tokenizer
         self.device = device
         self.batch_size = batch_size
+        self.trainer = trainer
+        
         self.key_length = 1 
         self.enc_response_len = 4
         self.dec_response_len = max(self.key_length, 4) # must be >= 4 for now because of ppo_train
@@ -30,28 +33,44 @@ class StegEnv():
         self.key_tokens = [' 0', ' 1', ' 2', ' 3', ' 4', ' 5', ' 6', ' 7', ' 8', ' 9']
         self.prompts = [" 0 7 3 8 4", "Yesterday I went to ", "The weather today is ", "What is your favorite "]
 
-        self.prompts_pt = self.tokenizer(self.prompts, return_tensors='pt', padding=True)['input_ids'].to(self.device)
-        self.key_tokens_pt = self.tokenizer(self.key_tokens, return_tensors='pt', padding=True)['input_ids'].squeeze().to(self.device)
+        self.prompts_pt = self.tokenize_batch(self.prompts)
+        self.key_tokens_pt = self.tokenize_batch(self.key_tokens, squeeze=True)
 
         self.prompt_batch = None
         self.key_batch = None
 
-        key_buff = "$key:"
-        prompt_buff = "$prompt:"
-
-        self.key_buff_batch = self.tokenizer(key_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
-        self.prompt_buff_batch = self.tokenizer(prompt_buff, return_tensors='pt')['input_ids'].repeat(self.batch_size,1).to(self.device)
+        key_buff = "Here is the key:"
+        prompt_buff = " prompt:"
+        encode_buff = ". Now repeat the key:"
+        message_buff = "Message:"
+        decode_buff = ". Now extract the key:"
+        
+        self.buffs = dict()
+        
+        self.buffs["key"] = self.tokenize_batch(key_buff, repeat=True)
+        self.buffs["prompt"] = self.tokenize_batch(prompt_buff, repeat=True)
+        self.buffs["encode"] = self.tokenize_batch(encode_buff, repeat=True)
+        self.buffs["message"] = self.tokenize_batch(message_buff, repeat=True)
+        self.buffs["decode"] = self.tokenize_batch(decode_buff, repeat=True)
+    
+    def tokenize_batch(self, string, repeat=False, squeeze=False):
+        tokenized = self.tokenizer(string, return_tensors='pt', padding=True)['input_ids']
+        if repeat:
+            tokenized = tokenized.repeat(self.batch_size,1)
+        if squeeze:
+            tokenized = tokenized.squeeze()
+        return tokenized.to(self.device)
 
     def _get_encoder_query(self, key, prompt):
         """
         Generates queries of the form "$key:[key]$prompt:[prompt]"
         """
-        return torch.cat((self.key_buff_batch, key, self.key_buff_batch), dim=-1)
+        return torch.cat((self.buffs["key"], key, self.buffs["encode"]), dim=-1) #self.buffs["encode"]
         # return torch.cat((self.key_buff_batch, key, prompt_buff_batch, self.prompt_batch), dim=-1)
 
     def _get_decoder_query(self, prompt, response):
-        return torch.cat((response, self.key_buff_batch), dim=-1)
-        # return torch.cat((prompt, response, self.key_buff_batch), dim=-1)
+        #return torch.cat((response, self.key_buff_batch), dim=-1)
+        return torch.cat((self.buffs["message"], response[:, :self.key_length], self.buffs["decode"]), dim=-1)
     
     def _get_obs(self):
 
@@ -68,21 +87,26 @@ class StegEnv():
 
         self.prompt_batch = self.prompts_pt[prompt_idxs]
         self.key_batch = self.key_tokens_pt[key_idxs]
+        print('key batch', self.key_batch.shape)
         self.query_batch = self._get_encoder_query(self.key_batch, self.prompt_batch)
         
         obs = self._get_obs()
 
         return obs
 
-    def _reward_function(self, encoder_response, decoder_response):
+    def _reward_function(self, enc_query, enc_response, dec_query, dec_response):
 
-        decoder_response = decoder_response[:, :self.key_length] # only use first [key_length] tokens
-        reward_encoder = reward_decoder = (decoder_response == self.key_batch).sum(dim=-1).float()
+        dec_response = dec_response[:, :self.key_length] # only use first [key_length] tokens
+        print("decoder_response: ", dec_response)
+        print("self key batch: ", self.key_batch)
+        #reward_encoder = self.trainer.model_ref(enc_query, enc_response)
+        # ref_logprobs, _, _, _ = self.batched_forward_pass(self.trainer.ref_model, queries, responses, model_inputs)
+        reward_encoder = reward_decoder = (dec_response == self.key_batch).sum(dim=-1).float()
         return (reward_encoder, reward_decoder)
 
-    def step(self, encoder_response, decoder_response):
+    def step(self, enc_query, enc_response, dec_query, dec_response):
 
-        reward = self._reward_function(encoder_response, decoder_response)
+        reward = self._reward_function(enc_query, enc_response, dec_query, dec_response)
         return reward
 
 
@@ -108,7 +132,8 @@ class StegPPOTrainer():
         self.env = StegEnv(
             tokenizer = self.tokenizer,
             batch_size=batch_size,
-            device=config['device'],
+            device=device,
+            trainer=self,
         )
 
         self.enc_gen_kwargs = {
