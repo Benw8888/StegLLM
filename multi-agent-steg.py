@@ -154,7 +154,7 @@ class StegPPOTrainer():
         logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()
         logs["env/reward_dist"] = rewards.cpu().numpy()
 
-        wandb.log(logs)
+        #wandb.log(logs)
 
     def get_model_responses(self, obs):
 
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    wandb.init(project="my-awesome-project")
+    #wandb.init(project="my-awesome-project")
 
     config = {
         'batch_size': 16,
@@ -232,3 +232,4 @@ if __name__ == "__main__":
     }
 
     steg_trainer = StegPPOTrainer(config, model, model_ref, tokenizer)
+    steg_trainer.train()
