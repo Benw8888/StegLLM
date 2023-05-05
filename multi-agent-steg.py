@@ -132,7 +132,7 @@ class StegPPOTrainer():
         self.env = StegEnv(
             tokenizer = self.tokenizer,
             batch_size=batch_size,
-            device=device,
+            device=self.device,
             trainer=self,
         )
 
@@ -153,6 +153,9 @@ class StegPPOTrainer():
             "suppress_tokens": self.suppress_tokens, 
             "max_new_tokens": self.env.dec_response_len, 
         }
+
+        if config['multi_agent']: from trl import PPOTrainer
+        else: from trl_custom import PPOTrainer
 
         ppo_config = PPOConfig(
             batch_size= batch_size * 2 if self.multi_agent else batch_size, # double for encoder + decoder responses
@@ -209,7 +212,7 @@ class StegPPOTrainer():
         for _ in range(self.episodes):
             obs = self.env.reset()
             enc_query, enc_response, dec_query, dec_response = self.get_model_responses(obs)
-            enc_reward, dec_reward = self.env.step(enc_response, dec_response)
+            enc_reward, dec_reward = self.env.step(enc_query, enc_response, dec_query, dec_response)
 
             print('-----------------------------------------------------------------------')
             print('prompt, keys:')
@@ -245,7 +248,7 @@ def main():
     print('device', current_device)
 
     config = {
-        'model_name': 'gpt2-large',
+        'model_name': 'gpt2',
         'batch_size': 16,
         'learning_rate': 1e-6,
         'steps': 1000,
@@ -262,11 +265,6 @@ def main():
         bias="none",
         task_type="CAUSAL_LM",
     )
-
-    if config['multi_agent']:
-        from trl import PPOTrainer
-    else:
-        from trl_custom import PPOTrainer
 
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config['model_name'],
