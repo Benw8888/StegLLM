@@ -2,7 +2,14 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from trl import PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
 import wandb
+from peft import PeftConfig, PeftModel, LoraConfig
 from typing import Dict, Tuple, Optional, List
+from accelerate import Accelerator
+
+DEFAULT_PAD_TOKEN = "[PAD]"
+DEFAULT_EOS_TOKEN = "</s>"
+DEFAULT_BOS_TOKEN = "</s>"
+DEFAULT_UNK_TOKEN = "</s>"
 
 class StegEnv():
     def __init__(self, 
@@ -95,12 +102,13 @@ class StegPPOTrainer():
         self.episodes = config['episodes']
         self.device = config['device']
         self.multi_agent = config['multi_agent']
+        self.use_wandb = config['use_wandb']
 
         # initialize environment
         self.env = StegEnv(
             tokenizer = self.tokenizer,
             batch_size=batch_size,
-            device=device,
+            device=config['device'],
         )
 
         self.enc_gen_kwargs = {
@@ -117,17 +125,19 @@ class StegPPOTrainer():
 
         self.dec_gen_kwargs = {
             **self.enc_gen_kwargs,
-            # "suppress_tokens": self.suppress_tokens, 
+            "suppress_tokens": self.suppress_tokens, 
             "max_new_tokens": self.env.dec_response_len, 
         }
 
-        config = PPOConfig(
-            batch_size= batch_size * 2 if multi_agent else batch_size, # double for encoder + decoder responses
+        ppo_config = PPOConfig(
+            batch_size= batch_size * 2 if self.multi_agent else batch_size, # double for encoder + decoder responses
             learning_rate=config['learning_rate'],
             steps=config['steps'],
+            optimize_cuda_cache=True,
             )
             
-        self.ppo_trainer = PPOTrainer(config, self.model, self.model_ref, self.tokenizer)
+        print(self.model, type(self.model))
+        self.ppo_trainer = PPOTrainer(ppo_config, self.model, None, self.tokenizer)
         
     def log_stats(
         self,
@@ -154,17 +164,18 @@ class StegPPOTrainer():
         logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()
         logs["env/reward_dist"] = rewards.cpu().numpy()
 
-        wandb.log(logs)
+        if self.use_wandb: wandb.log(logs)
 
     def get_model_responses(self, obs):
 
         encoder_query = obs['query']
-        encoder_response = self.model.generate(encoder_query, **self.enc_gen_kwargs) # should this be ppo_trainer.generate????
-        encoder_response = encoder_response[:, -self.enc_gen_kwargs["max_new_tokens"]:]
-
+        encoder_response = self.ppo_trainer.generate(list(encoder_query), return_prompt=False, **self.enc_gen_kwargs) # should this be ppo_trainer.generate????
+        encoder_response = torch.stack(encoder_response)
+        # encoder_response = encoder_response[:, -self.enc_gen_kwargs["max_new_tokens"]:]
         decoder_query = self.env._get_decoder_query(obs['prompt'], encoder_response)
-        decoder_response = self.model.generate(decoder_query, **self.dec_gen_kwargs)
-        decoder_response = decoder_response[:, -self.dec_gen_kwargs["max_new_tokens"]:]
+        decoder_response = self.ppo_trainer.generate(list(decoder_query), return_prompt=False, **self.dec_gen_kwargs)
+        decoder_response = torch.stack(decoder_response)
+        # decoder_response = decoder_response[:, -self.dec_gen_kwargs["max_new_tokens"]:]
 
         return encoder_query, encoder_response, decoder_query, decoder_response
 
@@ -203,32 +214,64 @@ class StegPPOTrainer():
             self.log_stats(stats, dec_reward)
 
 
-if __name__ == "__main__":
+def main():
+    current_device = Accelerator().local_process_index
 
-    multi_agent = True
-
-    if multi_agent:
-        from trl import PPOTrainer
-    else:
-        from trl_custom import PPOTrainer
-
-    device = 0 if torch.cuda.is_available() else 'cpu'
-
-    model = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2').to(device)
-    model_ref = AutoModelForCausalLMWithValueHead.from_pretrained('gpt2').to(device)
-
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    tokenizer.pad_token = tokenizer.eos_token
-
-    wandb.init(project="my-awesome-project")
+    print('device', current_device)
 
     config = {
+        'model_name': 'gpt2-large',
         'batch_size': 16,
         'learning_rate': 1e-6,
         'steps': 1000,
         'episodes': 1000,
-        'device': device,
-        'multi_agent': multi_agent
+        'device': current_device,
+        'multi_agent': True,
+        'use_wandb': True
     }
 
-    steg_trainer = StegPPOTrainer(config, model, model_ref, tokenizer)
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    if config['multi_agent']:
+        from trl import PPOTrainer
+    else:
+        from trl_custom import PPOTrainer
+
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config['model_name'],
+        peft_config=lora_config,
+        load_in_8bit=False,
+        device_map={"": current_device},
+        # layer_norm_names=[],
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(config['model_name'])
+
+    if "llama" in config['model_name']:
+        # required for llama
+        tokenizer.add_special_tokens(
+            {
+                "eos_token": DEFAULT_EOS_TOKEN,
+                "bos_token": DEFAULT_BOS_TOKEN,
+                "unk_token": DEFAULT_UNK_TOKEN,
+                "pad_token": DEFAULT_PAD_TOKEN,
+            }
+        )
+    else:
+        # required for gpt2
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if config['use_wandb']: wandb.init(project="my-project-runs")
+
+    steg_trainer = StegPPOTrainer(config, model, None, tokenizer)  
+    steg_trainer.train()  
+
+
+if __name__ == "__main__":
+    main()
