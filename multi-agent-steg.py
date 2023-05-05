@@ -252,7 +252,7 @@ def main():
         'episodes': 1000,
         'device': current_device,
         'multi_agent': True,
-        'use_wandb': True
+        'use_wandb': False
     }
 
     lora_config = LoraConfig(
