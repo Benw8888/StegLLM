@@ -248,7 +248,7 @@ def main():
     print('device', current_device)
 
     config = {
-        'model_name': 'gpt2',
+        'model_name': 'EleutherAI/gpt-j-6b',
         'batch_size': 16,
         'learning_rate': 1e-6,
         'steps': 1000,
