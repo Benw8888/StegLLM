@@ -59,6 +59,7 @@ class StegEnv():
         self.buffs["encode_prompt"] = self.tokenize_batch(encode_prompt, repeat=True, special_tokens=True)
         self.buffs["decode_prompt"] = self.tokenize_batch(decode_prompt, repeat=True, special_tokens=True)
         self.buffs["key"] = self.tokenize_batch(key_buff, repeat=True)
+        self.buffs["bos"] = self.tokenize_batch(DEFAULT_BOS_TOKEN, repeat=True)
         # self.buffs["prompt"] = self.tokenize_batch(prompt_buff, repeat=True)
         # self.buffs["encode"] = self.tokenize_batch(encode_buff, repeat=True)
         self.buffs["message"] = self.tokenize_batch(message_buff, repeat=True)
@@ -108,11 +109,17 @@ class StegEnv():
         return obs
 
     def _reward_function(self, enc_query, enc_response, dec_query, dec_response):
+        
+        frozen_inputs = torch.cat((self.buffs["bos"].to(self.device), enc_response.to(self.device)), dim=-1)
+        with torch.inference_mode():
+            _, frozen_loss, _ = self.trainer.model_ref(frozen_inputs, labels=frozen_inputs)  # extract model outputs
+        print("frozen loss: ", frozen_loss)
 
         dec_response = dec_response[:, :self.key_length] # only use first [key_length] tokens
         #reward_encoder = self.trainer.model_ref(enc_query, enc_response)
         # ref_logprobs, _, _, _ = self.batched_forward_pass(self.trainer.ref_model, queries, responses, model_inputs)
-        reward_encoder = reward_decoder = (dec_response == self.key_batch).sum(dim=-1).float()
+        reward_decoder = (dec_response == self.key_batch).sum(dim=-1).float()
+        reward_encoder = reward_decoder - frozen_loss
         return (reward_encoder, reward_decoder)
 
     def step(self, enc_query, enc_response, dec_query, dec_response):
@@ -130,7 +137,7 @@ class StegPPOTrainer():
         ):
         
         self.model = model
-        self.model_ref = model_ref
+        self.model_ref = model_ref.to(config['device'])
         self.tokenizer = tokenizer
 
         batch_size = config['batch_size']
@@ -281,7 +288,7 @@ def main():
         'batch_size': 8,
         'learning_rate': 1e-5,
         'steps': 100,
-        'episodes': 1000,
+        'episodes': 43,
         'device': current_device,
         'multi_agent': True,
         'use_wandb': True
@@ -302,6 +309,17 @@ def main():
         #device_map={"": current_device},
         # layer_norm_names=[],
     )
+    
+    if "llama" in config['model_name']:
+        model_ref = None
+    else:
+        model_ref = AutoModelForCausalLMWithValueHead.from_pretrained(
+            config['model_name'],
+            #peft_config=lora_config,
+            #load_in_8bit=True,
+            #device_map={"": current_device},
+            # layer_norm_names=[],
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(config['model_name'])
 
@@ -321,7 +339,7 @@ def main():
 
     if config['use_wandb']: wandb.init(project="ben-steg-runs")
 
-    steg_trainer = StegPPOTrainer(config, model, None, tokenizer)  
+    steg_trainer = StegPPOTrainer(config, model, model_ref, tokenizer)  
     steg_trainer.train()  
 
 
